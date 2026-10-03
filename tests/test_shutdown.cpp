@@ -10,6 +10,7 @@
 #include <future>
 #include <latch>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -158,7 +159,7 @@ TEST(submit_after_shutdown_throws_runtime_error) {
         }
     }
     try {
-        pool.submit([](int a, int b) { return a + b; }, 1, 2);
+        pool.submit([] { return std::string("rejected"); });
     } catch (const std::runtime_error&) {
         ++rejected;
     }

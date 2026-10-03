@@ -14,11 +14,12 @@ using namespace std::chrono_literals;
 
 namespace {
 
-int square(int x) { return x * x; }
+int answer() { return 42; }
 
 struct Multiplier {
     int factor;
-    int operator()(int x) const { return x * factor; }
+    int value;
+    int operator()() const { return value * factor; }
 };
 
 struct Account {
@@ -53,48 +54,48 @@ TEST(void_task_future_signals_completion) {
     EXPECT_TRUE(done);
 }
 
-TEST(accepts_function_pointer_with_arguments) {
+TEST(accepts_plain_function) {
     ThreadPool pool(2);
-    auto f = pool.submit(square, 9);
-    EXPECT_EQ(f.get(), 81);
+    auto f = pool.submit(answer);
+    EXPECT_EQ(f.get(), 42);
 }
 
 TEST(accepts_function_object) {
     ThreadPool pool(2);
-    auto f = pool.submit(Multiplier{3}, 5);
+    auto f = pool.submit(Multiplier{3, 5});
     EXPECT_EQ(f.get(), 15);
 }
 
-TEST(accepts_member_function_pointer) {
+TEST(lambda_can_call_member_function) {
     ThreadPool pool(1);
     Account acct;
-    auto f = pool.submit(&Account::deposit, &acct, 50);
+    auto f = pool.submit([&acct] { return acct.deposit(50); });
     EXPECT_EQ(f.get(), 150);
     EXPECT_EQ(acct.balance, 150);
 }
 
-TEST(arguments_are_copied_at_submit_time) {
+TEST(capture_by_value_is_copied_at_submit_time) {
     ThreadPool pool(1);
     int value = 1;
-    auto f = pool.submit([](int v) { return v; }, value);
+    auto f = pool.submit([value] { return value; });
     value = 999;  // must not affect the already-submitted task
     EXPECT_EQ(f.get(), 1);
 }
 
-TEST(std_ref_passes_by_reference) {
+TEST(capture_by_reference_writes_back) {
     ThreadPool pool(1);
     int value = 0;
-    auto f = pool.submit([](int& v) { v = 123; }, std::ref(value));
+    auto f = pool.submit([&value] { value = 123; });
     f.get();
     EXPECT_EQ(value, 123);
 }
 
-TEST(move_only_callable_argument_and_result) {
+TEST(move_only_capture_and_result) {
+    // packaged_task accepts move-only callables, so a lambda owning a
+    // unique_ptr works, and so does returning one.
     ThreadPool pool(2);
     auto owned = std::make_unique<int>(10);
-    auto f = pool.submit(
-        [p = std::move(owned)](std::unique_ptr<int> q) { return std::make_unique<int>(*p + *q); },
-        std::make_unique<int>(5));
+    auto f = pool.submit([p = std::move(owned)] { return std::make_unique<int>(*p + 5); });
     std::unique_ptr<int> result = f.get();
     EXPECT_EQ(*result, 15);
 }
@@ -210,6 +211,53 @@ TEST(future_is_not_ready_until_task_finishes) {
     EXPECT_TRUE(f.wait_for(30ms) == std::future_status::timeout);
     gate.set_value();
     EXPECT_EQ(f.get(), 1);
+}
+
+TEST(submit_batch_returns_results_in_index_order) {
+    ThreadPool pool(4);
+    auto futures = pool.submit_batch(100, [](std::size_t i) { return i * i; });
+    EXPECT_EQ(futures.size(), 100u);
+    for (std::size_t i = 0; i < futures.size(); ++i) {
+        EXPECT_EQ(futures[i].get(), i * i);
+    }
+}
+
+TEST(submit_batch_isolates_exceptions_per_task) {
+    ThreadPool pool(2);
+    auto futures = pool.submit_batch(6, [](std::size_t i) -> std::size_t {
+        if (i % 3 == 0) throw std::runtime_error("bad index");
+        return i;
+    });
+    int failed = 0;
+    std::size_t sum = 0;
+    for (auto& f : futures) {
+        try {
+            sum += f.get();
+        } catch (const std::runtime_error&) {
+            ++failed;
+        }
+    }
+    EXPECT_EQ(failed, 2);       // indices 0 and 3
+    EXPECT_EQ(sum, 1u + 2 + 4 + 5);
+}
+
+TEST(submit_batch_of_zero_returns_no_futures) {
+    ThreadPool pool(1);
+    auto futures = pool.submit_batch(0, [](std::size_t) {});
+    EXPECT_TRUE(futures.empty());
+}
+
+TEST(submit_batch_after_shutdown_throws_and_queues_nothing) {
+    ThreadPool pool(2);
+    pool.shutdown();
+    bool threw = false;
+    try {
+        pool.submit_batch(10, [](std::size_t i) { return i; });
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(pool.pending(), 0u);
 }
 
 int main() { return RUN_ALL_TESTS(); }

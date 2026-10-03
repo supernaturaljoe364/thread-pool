@@ -142,4 +142,38 @@ TEST(mpmc_every_item_delivered_exactly_once) {
     EXPECT_EQ(q.size(), 0u);
 }
 
+TEST(push_all_appends_in_order) {
+    BlockingQueue<int> q;
+    q.push(0);
+    EXPECT_TRUE(q.push_all({1, 2, 3}));
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(*q.pop(), i);
+}
+
+TEST(push_all_wakes_every_blocked_consumer) {
+    BlockingQueue<int> q;
+    constexpr int kConsumers = 4;
+    std::vector<std::future<std::optional<int>>> consumers;
+    for (int i = 0; i < kConsumers; ++i) {
+        consumers.push_back(std::async(std::launch::async, [&q] { return q.pop(); }));
+    }
+    for (auto& c : consumers) EXPECT_TRUE(c.wait_for(20ms) == std::future_status::timeout);
+
+    q.push_all({10, 20, 30, 40});  // single notify_all must reach all four
+
+    int sum = 0;
+    for (auto& c : consumers) {
+        EXPECT_TRUE(c.wait_for(2s) == std::future_status::ready);
+        sum += *c.get();
+    }
+    EXPECT_EQ(sum, 100);
+}
+
+TEST(push_all_after_close_enqueues_nothing) {
+    BlockingQueue<int> q;
+    q.close();
+    EXPECT_TRUE(!q.push_all({1, 2, 3}));
+    EXPECT_TRUE(!q.push_all({}));
+    EXPECT_EQ(q.size(), 0u);
+}
+
 int main() { return RUN_ALL_TESTS(); }

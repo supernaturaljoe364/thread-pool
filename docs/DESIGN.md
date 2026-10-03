@@ -357,41 +357,35 @@ exception slot, ready flag, mutex + condvar). `future.get()` is essentially
 ### How `submit()` works (Q12)
 
 ```cpp
-auto bound = [func = std::forward<F>(f), ...captured = std::forward<Args>(args)]() mutable -> R {
-    return std::invoke(std::move(func), std::move(captured)...);
-};
-auto task = std::make_shared<std::packaged_task<R()>>(std::move(bound));
-std::future<R> result = task->get_future();
-enqueue([task] { (*task)(); });
-return result;
+template <typename F>
+auto ThreadPool::submit(F f) {
+    using R = decltype(f());                                   // 1
+    auto task = std::make_shared<std::packaged_task<R()>>(std::move(f));  // 2
+    std::future<R> result = task->get_future();                // 3
+    enqueue([task] { (*task)(); });                            // 4
+    return result;
+}
 ```
 
-1. **Bind** `f(args...)` into a zero-argument lambda. Arguments are
-   decay-copied or moved in (`std::forward` into an init-capture). The task owns
-   its inputs and can't dangle into the caller's stack frame after `submit`
-   returns. To share a variable deliberately, pass `std::ref(x)`, the same
-   convention as `std::thread`.
-2. **`std::invoke`** makes one code path work for lambdas, function pointers,
-   functors **and** member-function pointers (`submit(&Account::deposit, &acct, 50)`).
-3. **Wrap in `packaged_task<R()>`** and take its future *before* enqueuing.
-   After `enqueue`, a worker may run the task immediately.
+1. **`decltype(f())`** is "the type you get by calling `f`". That's the
+   future's type: `int` for `[] { return 42; }`, `void` for `[] {}`.
+2. **Wrap `f` in a `packaged_task<R()>`.** It takes no arguments. To pass
+   inputs, the caller captures them in a lambda: `pool.submit([x] { return
+   work(x); })`. `[x]` copies `x` into the task at submit time, so it can't
+   dangle. `[&x]` shares it, and the caller must keep `x` alive.
+3. **Take the future before enqueuing.** After `enqueue`, a worker may run the
+   task immediately.
 4. **Type-erase to `std::function<void()>`.** The queue holds one type no
-   matter what each task returns. The future carries `R`; the queue never needs
-   to know it.
+   matter what each task returns. The future carries `R`, so the queue never
+   needs to know it.
 
 **Why `shared_ptr<packaged_task>`?** `packaged_task` is move-only, and
 `std::function` requires its target to be *copyable*. A lambda holding a
 `shared_ptr` is copyable. The cost is one extra heap allocation per task.
 C++23's `std::move_only_function` removes this workaround.
 
-**Why the `requires` clause?** Without it, `submit(f, wrong_args)` fails deep
-inside `invoke_result_t` with a long template error. With it, the compiler
-says *"constraints not satisfied: is_invocable_v<...> evaluated to false"* at
-the call site.
-
-**The return type** is computed with `std::invoke_result_t<decay_t<F>, decay_t<Args>...>`,
-which is exactly how the stored callable is called (as rvalues), so the
-declared type always matches what `invoke` produces.
+**Why no `submit(f, arg1, arg2)` form?** It would need variadic templates and
+perfect forwarding, and a lambda capture does the same job more readably.
 
 ### How exceptions propagate (Q13)
 
@@ -444,8 +438,8 @@ caller does after `get()` returns. That's why a task can fill a plain
 ### Verification
 
 `tests/test_futures.cpp` (18 tests): values, strings, `void`, function pointers,
-functors, member-function pointers, copy-at-submit semantics, `std::ref`,
-move-only callable + argument + result, custom exception type & fields
+functors, calling member functions via lambdas, capture by value vs by reference,
+move-only capture + result, custom exception type & fields
 preserved, non-`std::exception` types, worker survives alternating failures,
 empty `std::function`, shutdown-from-worker via future, nested submission,
 memory visibility through `get()`, ordered collection, and a future that stays

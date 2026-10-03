@@ -210,4 +210,18 @@ TEST(all_sleeping_workers_wake_for_a_burst) {
     }
 }
 
+TEST(one_batch_wakes_all_sleeping_workers) {
+    // submit_batch issues a single notify_all; all kWorkers rendezvous tasks
+    // can only finish if every sleeping worker was woken by it.
+    constexpr int kWorkers = 4;
+    ThreadPool pool(kWorkers);
+    std::this_thread::sleep_for(50ms);  // idle -> all workers asleep
+
+    std::latch all_running(kWorkers);
+    auto futures = pool.submit_batch(kWorkers, [&all_running](std::size_t) {
+        return rendezvous(all_running);
+    });
+    for (auto& f : futures) EXPECT_TRUE(f.get());
+}
+
 int main() { return RUN_ALL_TESTS(); }

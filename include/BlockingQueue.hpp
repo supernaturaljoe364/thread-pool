@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include <vector>
 
 // A thread-safe, unbounded FIFO queue supporting multiple producers and
 // multiple consumers (MPMC).
@@ -41,6 +42,27 @@ public:
         // Notify after releasing the lock: the woken consumer can grab the
         // mutex immediately instead of waking up only to block on it again.
         not_empty_.notify_one();
+        return true;
+    }
+
+    // Enqueues every item under one lock acquisition, all-or-nothing: returns
+    // false (and enqueues nothing) if the queue has been closed.
+    bool push_all(std::vector<T> batch) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) {
+                return false;
+            }
+            for (auto& item : batch) {
+                items_.push_back(std::move(item));
+            }
+        }
+        // One wakeup for the whole batch instead of one per item. Waking every
+        // sleeper may over-wake for a small batch; they just re-check the
+        // predicate and go back to sleep.
+        if (!batch.empty()) {
+            not_empty_.notify_all();
+        }
         return true;
     }
 

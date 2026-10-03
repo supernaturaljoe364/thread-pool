@@ -2,14 +2,12 @@
 
 #include "BlockingQueue.hpp"
 
-#include <concepts>
 #include <cstddef>
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -33,19 +31,23 @@ public:
     ThreadPool(ThreadPool&&) = delete;
     ThreadPool& operator=(ThreadPool&&) = delete;
 
-    // Queues f(args...) for execution and returns a future for its result.
-    // Works with lambdas, function pointers, function objects and member
-    // function pointers (via std::invoke). Arguments are copied/moved into
-    // the task, like std::thread; use std::ref to pass by reference.
+    // Queues f() for execution and returns a future for its result. f is
+    // any callable that takes no arguments (lambda, function, functor).
+    // To pass arguments, capture them: pool.submit([x] { return work(x); }).
     //
     // If the task throws, the exception is stored in the future and rethrown
     // by future.get(); the worker thread is unaffected.
     //
     // Throws std::runtime_error if the pool has been shut down.
-    template <typename F, typename... Args>
-        requires std::invocable<std::decay_t<F>, std::decay_t<Args>...>
-    auto submit(F&& f, Args&&... args)
-        -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>;
+    template <typename F>
+    auto submit(F f);
+
+    // Runs f(0), f(1), ..., f(count - 1) as separate tasks and returns their
+    // futures in order. Queues them all with one lock + one notify_all
+    // instead of one per task, which is much cheaper for lots of tiny tasks.
+    // Throws std::runtime_error (and queues nothing) after shutdown.
+    template <typename F>
+    auto submit_batch(std::size_t count, F f);
 
     // Stops accepting new tasks, lets workers finish everything already queued,
     // then joins them. Blocks until all workers have exited.
@@ -64,6 +66,7 @@ public:
 private:
     // Type-erased, non-template half of submit(); lives in ThreadPool.cpp.
     void enqueue(std::function<void()> task);
+    void enqueue_all(std::vector<std::function<void()>> tasks);
     void worker_loop();
 
     // Declaration order matters: members are destroyed in reverse order, so
@@ -74,33 +77,39 @@ private:
     std::mutex shutdown_mutex_;  // serialises concurrent shutdown() calls
 };
 
-template <typename F, typename... Args>
-    requires std::invocable<std::decay_t<F>, std::decay_t<Args>...>
-auto ThreadPool::submit(F&& f, Args&&... args)
-    -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>> {
-    using R = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>;
+template <typename F>
+auto ThreadPool::submit(F f) {
+    using R = decltype(f());  // whatever f returns
 
-    // 1. Bind the callable and its arguments into a zero-argument callable.
-    //    Everything is stored by value inside the lambda, so the task can't
-    //    dangle into the caller's stack frame after submit() returns.
-    auto bound = [func = std::forward<F>(f),
-                  ... captured = std::forward<Args>(args)]() mutable -> R {
-        return std::invoke(std::move(func), std::move(captured)...);
-    };
-
-    // 2. packaged_task pairs the callable with a promise. Running it stores
-    //    either the return value or the thrown exception in the shared state
-    //    that the future reads from.
+    // packaged_task pairs the callable with a promise: running it stores the
+    // return value (or the thrown exception) where the future can read it.
     //
-    //    packaged_task is move-only but std::function requires a copyable
-    //    target, so it's held through a shared_ptr. (C++23's
-    //    std::move_only_function removes the need for this.)
-    auto task = std::make_shared<std::packaged_task<R()>>(std::move(bound));
+    // packaged_task is move-only but std::function needs a copyable target,
+    // so it's held through a shared_ptr.
+    auto task = std::make_shared<std::packaged_task<R()>>(std::move(f));
     std::future<R> result = task->get_future();
 
-    // 3. Hand a type-erased void() wrapper to the queue. If the pool is shut
-    //    down this throws and `task` (and the unreturned future) is discarded.
+    // Hand a type-erased void() wrapper to the queue. If the pool is shut
+    // down this throws and the task is discarded.
     enqueue([task] { (*task)(); });
-
     return result;
+}
+
+template <typename F>
+auto ThreadPool::submit_batch(std::size_t count, F f) {
+    using R = decltype(f(std::size_t{0}));  // whatever f returns
+
+    std::vector<std::future<R>> futures;
+    std::vector<std::function<void()>> tasks;
+
+    // Package each task exactly like submit() does, but collect them locally
+    // so the queue lock is taken once for the whole batch.
+    for (std::size_t i = 0; i < count; ++i) {
+        auto task = std::make_shared<std::packaged_task<R()>>([f, i] { return f(i); });
+        futures.push_back(task->get_future());
+        tasks.push_back([task] { (*task)(); });
+    }
+
+    enqueue_all(std::move(tasks));
+    return futures;
 }

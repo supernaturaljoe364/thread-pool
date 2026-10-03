@@ -55,6 +55,12 @@ void ThreadPool::enqueue(std::function<void()> task) {
     }
 }
 
+void ThreadPool::enqueue_all(std::vector<std::function<void()>> tasks) {
+    if (!queue_.push_all(std::move(tasks))) {
+        throw std::runtime_error("ThreadPool::submit_batch() called after shutdown");
+    }
+}
+
 void ThreadPool::shutdown() {
     if (t_owning_pool == this) {
         throw std::logic_error("ThreadPool::shutdown() called from one of its own worker threads");

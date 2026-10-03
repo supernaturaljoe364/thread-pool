@@ -44,14 +44,16 @@ std::uint64_t run_pool(ThreadPool& pool, std::uint64_t task_size) {
     const std::uint64_t tasks = kTotalUnits / task_size;
     std::vector<std::future<std::uint64_t>> futures;
     futures.reserve(tasks);
-    for (std::uint64_t t = 0; t < tasks; ++t) futures.push_back(pool.submit(spin, t, task_size));
+    for (std::uint64_t t = 0; t < tasks; ++t) {
+        futures.push_back(pool.submit([t, task_size] { return spin(t, task_size); }));
+    }
     std::uint64_t acc = 0;
     for (auto& f : futures) acc += f.get();
     return acc;
 }
 
 template <typename Fn>
-double best_ms(Fn&& fn, std::uint64_t& result) {
+double best_ms(Fn fn, std::uint64_t& result) {
     double best = 1e18;
     for (int r = 0; r < kRepeats; ++r) {
         const auto start = Clock::now();

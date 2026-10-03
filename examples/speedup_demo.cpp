@@ -61,7 +61,8 @@ int main() {
         ThreadPool pool(workers);
         std::vector<std::future<std::uint64_t>> parts;
         for (std::uint64_t i = 0; i < kChunks; ++i) {
-            parts.push_back(pool.submit(count_primes, i * kChunkSize, (i + 1) * kChunkSize));
+            parts.push_back(
+                pool.submit([i] { return count_primes(i * kChunkSize, (i + 1) * kChunkSize); }));
         }
         for (auto& p : parts) pool_total += p.get();
     }

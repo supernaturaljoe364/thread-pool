@@ -48,7 +48,8 @@ std::uint64_t run_pool(std::size_t workers) {
     ThreadPool pool(workers);
     std::vector<std::future<std::uint64_t>> parts;
     for (std::uint64_t i = 0; i < kChunks; ++i) {
-        parts.push_back(pool.submit(count_primes, i * kChunkSize, (i + 1) * kChunkSize));
+        parts.push_back(
+            pool.submit([i] { return count_primes(i * kChunkSize, (i + 1) * kChunkSize); }));
     }
     std::uint64_t total = 0;
     for (auto& p : parts) total += p.get();
@@ -57,7 +58,7 @@ std::uint64_t run_pool(std::size_t workers) {
 
 // Best of kRepeats: the minimum is the run least disturbed by other processes.
 template <typename Fn>
-double best_ms(Fn&& fn, std::uint64_t expected) {
+double best_ms(Fn fn, std::uint64_t expected) {
     double best = 1e18;
     for (int r = 0; r < kRepeats; ++r) {
         const auto start = Clock::now();

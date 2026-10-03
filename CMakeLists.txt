@@ -49,3 +49,21 @@ tp_add_test(test_thread_pool)
 tp_add_test(test_futures)
 tp_add_test(test_concurrency)
 tp_add_test(test_shutdown)
+
+# ---------------------------------------------------------------------------
+# Examples
+# ---------------------------------------------------------------------------
+add_executable(basic_demo examples/basic_demo.cpp)
+target_link_libraries(basic_demo PRIVATE threadpool)
+target_compile_options(basic_demo PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(speedup_demo examples/speedup_demo.cpp)
+target_link_libraries(speedup_demo PRIVATE threadpool)
+target_compile_options(speedup_demo PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
+# Benchmarks (build in Release: cmake -B build -DCMAKE_BUILD_TYPE=Release)
+# ---------------------------------------------------------------------------
+add_executable(bench_workers benchmarks/bench_workers.cpp)
+target_link_libraries(bench_workers PRIVATE threadpool)
+target_compile_options(bench_workers PRIVATE -Wall -Wextra -Wpedantic)

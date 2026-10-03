@@ -40,8 +40,12 @@ function(tp_add_test name)
   target_link_libraries(${name} PRIVATE threadpool)
   target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME ${name} COMMAND ${name})
+  # A deadlock shows up as a hang; turn it into a failure instead.
+  set_tests_properties(${name} PROPERTIES TIMEOUT 120)
 endfunction()
 
 tp_add_test(test_blocking_queue)
 tp_add_test(test_thread_pool)
 tp_add_test(test_futures)
+tp_add_test(test_concurrency)
+tp_add_test(test_shutdown)

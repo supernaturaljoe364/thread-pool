@@ -450,3 +450,95 @@ preserved, non-`std::exception` types, worker survives alternating failures,
 empty `std::function`, shutdown-from-worker via future, nested submission,
 memory visibility through `get()`, ordered collection, and a future that stays
 not-ready until a gate opens.
+
+---
+
+## 4. Test suite and correctness review
+
+### Scenario → test map
+
+| # | Scenario | Test(s) |
+|---|---|---|
+| 1 | Multiple tasks run concurrently | `test_concurrency`: `n_workers_run_n_tasks_simultaneously`, `concurrent_tasks_use_distinct_threads` |
+| 2 | More tasks than workers | `test_concurrency`: `more_tasks_than_workers_all_complete`, `concurrency_never_exceeds_worker_count`, `backlog_is_visible_while_workers_are_busy` |
+| 3 | Tasks returning values | `test_futures`: `returns_*`, `accepts_*`, `move_only_callable_argument_and_result`, … |
+| 4 | Tasks throwing exceptions | `test_futures`: `exception_propagates_through_future`, `non_std_exception_*`, `worker_survives_exceptions_and_keeps_serving` |
+| 5 | Multiple producer threads | `test_concurrency`: `multiple_producers_every_task_runs_exactly_once` |
+| 6 | Workers sleep on empty queue | `test_concurrency`: `idle_workers_consume_no_cpu` |
+| 7 | Workers wake for new tasks | `test_concurrency`: `sleeping_worker_wakes_for_new_task`, `all_sleeping_workers_wake_for_a_burst` |
+| 8 | Graceful shutdown with queued tasks | `test_shutdown`: `shutdown_runs_every_queued_task`, `destructor_drains_queue` |
+| 9 | Shutdown during execution | `test_shutdown`: `shutdown_waits_for_in_flight_tasks`, `running_task_cannot_submit_once_shutdown_began` |
+| 10 | Submit after shutdown | `test_shutdown`: `submit_after_shutdown_throws_runtime_error` |
+| – | Shutdown racing producers | `test_shutdown`: `every_accepted_task_runs_even_when_racing_shutdown` |
+| – | Concurrent `shutdown()` | `test_shutdown`: `concurrent_shutdown_calls_all_block_until_done` |
+| – | No leaked threads | `test_shutdown`: `destructor_leaves_no_worker_threads_running` (counts `/proc/self/task`) |
+
+### Making concurrency tests deterministic
+
+"Sleep 100 ms and hope the other thread did its thing" gives flaky tests. The
+suite uses explicit events instead (`tests/test_helpers.hpp`):
+
+- **`Gate`** (`promise<void>` + `shared_future<void>`): holds tasks at a known
+  point until the test releases them. Used to keep workers busy so a backlog
+  builds, or so shutdown happens while tasks are mid-flight.
+- **`std::latch`**: "wait until K tasks have started". `rendezvous()` makes K
+  tasks wait for each other, which can only succeed if K run at the *same
+  time*. That proves concurrency instead of inferring it from timing. It has
+  a timeout, so a broken pool fails the test instead of hanging it.
+- **Probing `submit()`**: to know shutdown has *really begun* (queue closed),
+  the test retries `submit()` until it throws. That's deterministic, unlike
+  sleeping and assuming the shutdown thread got scheduled.
+
+The remaining timing-based checks only use timeouts in the "must *not* have
+happened yet" direction (e.g. `shutdown` still blocked after 100 ms while a
+gate is shut). They can't produce false failures on a slow machine.
+`idle_workers_consume_no_cpu` compares CPU time to wall time with a 10× margin.
+
+---
+
+## Race conditions (Q15)
+
+| Potential race | Why it can't happen here |
+|---|---|
+| Two workers pop the same task | `front()`+`pop_front()` under the queue mutex |
+| Pop from an empty queue after being woken | `wait(lock, pred)` re-checks the predicate under the lock |
+| Lost wakeup (push/close between a worker's check and its sleep) | state changed under the same mutex; CV unlock+sleep is atomic |
+| Task accepted after shutdown and never run | `closed_` is checked inside `push()` under the lock `close()` takes |
+| Worker uses the queue after it's destroyed | `queue_` declared before `workers_`; `shutdown()` joins before members die |
+| Two threads `join()` the same worker | `shutdown_mutex_` + `joinable()` check |
+| Reading a task's result before it's written | `future.get()` synchronizes-with `set_value` (happens-before) |
+| `pending()` / `size()` used for decisions | documented as snapshots only |
+
+What the pool **can't** protect against: tasks that share data among
+themselves without synchronization, and tasks capturing references
+(`[&x]`) to objects that die before the task runs.
+
+## Deadlocks (Q16)
+
+| Scenario | Status |
+|---|---|
+| `shutdown()` / destructor called from a worker (self-join) | detected via `thread_local` → `std::logic_error` |
+| Join without closing the queue | impossible by construction: `close()` precedes the joins |
+| Running the task while holding the queue lock (task calls `submit`) | the lock is released before the task runs |
+| `shutdown_mutex_` held while joining | workers never take it, so no cycle |
+| **Task blocks on another task's future** | **Not prevented.** If all N workers wait on futures of tasks still queued, nobody runs them. Classic thread-pool starvation deadlock. Avoid blocking `get()` inside tasks. |
+| Task waits on something only the submitting thread will do after `shutdown()` | user-level deadlock: shutdown waits for the task, the task waits for the caller |
+| Constructor fails mid-way | queue closed before the partial set of jthreads is joined |
+
+## Contention (Q17)
+
+- **The single queue mutex** is the one shared hot spot. Every `submit` and
+  every `pop` takes it. With tiny tasks (a few ns of work) and many
+  workers/producers, threads spend more time queuing for the lock than
+  working. The remedies are batching work into fewer, larger tasks, or a
+  work-stealing design (a deque per worker, steal from others when empty),
+  which is what TBB and Folly do.
+- **Per-task allocation:** `make_shared<packaged_task>`, the future's shared
+  state, and `std::function`'s heap storage all go through the allocator,
+  which can contend under load.
+- **Thundering herd:** `close()` uses `notify_all` on purpose, but that is
+  once per pool lifetime. Ordinary pushes use `notify_one`, so one task wakes
+  one worker.
+- **False sharing in user code:** tasks writing to adjacent elements of a
+  shared array share cache lines and slow each other down. That isn't the
+  pool's doing, but it shows up in benchmarks.

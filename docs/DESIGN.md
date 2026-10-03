@@ -322,9 +322,9 @@ caller's `std::future`.
 
 ### Verification
 
-`tests/test_thread_pool.cpp` (11 tests): worker count, default size, every task
+`tests/test_thread_pool.cpp` (10 tests): worker count, default size, every task
 runs, tasks run on worker threads only, a single worker survives throwing
-tasks, empty task rejected, submit-after-shutdown throws, shutdown idempotent,
+tasks, submit-after-shutdown throws, shutdown idempotent,
 shutdown-from-worker rejected instead of deadlocking, destructor waits for
 queued and running work.
 
@@ -437,13 +437,14 @@ caller does after `get()` returns. That's why a task can fill a plain
 
 ### Verification
 
-`tests/test_futures.cpp` (18 tests): values, strings, `void`, function pointers,
+`tests/test_futures.cpp` (22 tests): values, strings, `void`, function pointers,
 functors, calling member functions via lambdas, capture by value vs by reference,
 move-only capture + result, custom exception type & fields
 preserved, non-`std::exception` types, worker survives alternating failures,
 empty `std::function`, shutdown-from-worker via future, nested submission,
 memory visibility through `get()`, ordered collection, and a future that stays
-not-ready until a gate opens.
+not-ready until a gate opens, plus 4 `submit_batch` tests (index order,
+per-task exceptions, empty batch, after shutdown).
 
 ---
 
@@ -536,3 +537,68 @@ themselves without synchronization, and tasks capturing references
 - **False sharing in user code:** tasks writing to adjacent elements of a
   shared array share cache lines and slow each other down. That isn't the
   pool's doing, but it shows up in benchmarks.
+
+---
+
+## 5. Batched submission (`submit_batch`, `BlockingQueue::push_all`)
+
+### The problem
+
+Benchmarking tiny tasks (16 units of work, ~16 ns each) showed the pool about
+1600x *slower* than a plain loop, at ~23 us per task. The cost isn't the work,
+it's `submit()`: for each task it takes the queue lock, allocates, and calls
+`notify_one`. When tasks are tiny, workers drain the queue faster than the
+producer fills it and go back to sleep, so almost every `notify_one` has to
+wake a sleeping thread. That is a futex syscall, measured at ~19 us on this
+WSL2 setup (a few us on bare metal).
+
+### The design
+
+`submit_batch(count, f)` builds all `count` tasks locally (no lock held), then
+hands the whole vector to `BlockingQueue::push_all`, which takes the lock once,
+appends everything, and calls `notify_all` once. The lock and the wakeup are
+paid per batch instead of per task: ~0.8 us per task instead of ~20 us.
+
+```cpp
+auto futures = pool.submit_batch(1000, [](std::size_t i) { return i * i; });
+```
+
+### Why `notify_all` and not `notify_one`?
+
+A batch of N items can keep up to N workers busy. `notify_one` would wake only
+one of them and the rest would sleep until the next push. With `notify_all`
+every sleeper wakes and re-checks the predicate. For a small batch that
+over-wakes a few workers, which just go back to sleep, but that cost is paid
+once per batch.
+
+### Semantics and pitfalls
+
+- **All-or-nothing:** `push_all` checks `closed_` once under the lock. After
+  shutdown nothing is queued and `submit_batch` throws.
+- **Each task gets its own copy of `f`**, so `f` must be copyable and, if it
+  captures by reference, must stay valid until the futures are ready.
+- **Memory:** all tasks and futures exist at once, so a batch of 10 million
+  allocates 10 million tasks up front.
+- **Latency vs throughput:** the first task can't start until the whole batch
+  is built. Fine for bulk work, wrong for latency-sensitive single tasks.
+
+### Results (`bench_granularity`, 8 workers)
+
+| units/task | submit speedup | submit_batch speedup |
+|-----------:|---------------:|---------------------:|
+| 16         | 0.00x          | 0.02x                |
+| 1024       | 0.06x          | 3.21x                |
+| 4096       | 3.13x          | 4.74x                |
+| 65536      | 6.01x          | 5.80x                |
+
+Batching moves the break-even point from tasks of ~4-16 us down to ~1 us. For
+large tasks the two are the same, because the per-task overhead no longer
+matters.
+
+### Verification
+
+`test_blocking_queue`: `push_all` order, one `notify_all` waking every blocked
+consumer, rejected after close with nothing enqueued.
+`test_futures`: results in index order, an exception in one task doesn't affect
+the others, empty batch, batch after shutdown queues nothing.
+`test_concurrency`: one batch wakes every sleeping worker (rendezvous test).

@@ -67,3 +67,7 @@ target_compile_options(speedup_demo PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(bench_workers benchmarks/bench_workers.cpp)
 target_link_libraries(bench_workers PRIVATE threadpool)
 target_compile_options(bench_workers PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(bench_granularity benchmarks/bench_granularity.cpp)
+target_link_libraries(bench_granularity PRIVATE threadpool)
+target_compile_options(bench_granularity PRIVATE -Wall -Wextra -Wpedantic)

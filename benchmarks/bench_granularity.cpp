@@ -4,6 +4,9 @@
 // condvar wakeup of a sleeping worker (a futex syscall; ~20us under WSL2,
 // a few us on bare metal). When a task does less work than that, the pool is
 // slower than just running the loop on one thread.
+//
+// submit_batch() pays the lock + wakeup once per batch instead of once per
+// task, so it stays fast down to much smaller tasks.
 
 #include "ThreadPool.hpp"
 
@@ -52,6 +55,14 @@ std::uint64_t run_pool(ThreadPool& pool, std::uint64_t task_size) {
     return acc;
 }
 
+std::uint64_t run_batch(ThreadPool& pool, std::uint64_t task_size) {
+    auto futures = pool.submit_batch(kTotalUnits / task_size,
+                                     [task_size](std::size_t t) { return spin(t, task_size); });
+    std::uint64_t acc = 0;
+    for (auto& f : futures) acc += f.get();
+    return acc;
+}
+
 template <typename Fn>
 double best_ms(Fn fn, std::uint64_t& result) {
     double best = 1e18;
@@ -71,23 +82,23 @@ int main() {
 
     std::cout << "total work: " << kTotalUnits << " units, workers: " << pool.size()
               << ", best of " << kRepeats << "\n\n"
-              << std::setw(12) << "units/task" << std::setw(10) << "tasks" << std::setw(11)
-              << "seq (ms)" << std::setw(12) << "pool (ms)" << std::setw(10) << "speedup"
-              << std::setw(16) << "us/task (pool)" << '\n'
+              << std::setw(12) << "units/task" << std::setw(9) << "tasks" << std::setw(11)
+              << "seq (ms)" << std::setw(13) << "submit (ms)" << std::setw(12) << "batch (ms)"
+              << std::setw(10) << "submit" << std::setw(9) << "batch" << '\n'
               << std::fixed;
 
     for (std::uint64_t size = 16; size <= (1u << 16); size *= 4) {
-        std::uint64_t seq_result = 0, pool_result = 0;
+        std::uint64_t seq_result = 0, pool_result = 0, batch_result = 0;
         const double seq = best_ms([size] { return run_sequential(size); }, seq_result);
         const double par = best_ms([&pool, size] { return run_pool(pool, size); }, pool_result);
-        if (seq_result != pool_result) {
+        const double bat = best_ms([&pool, size] { return run_batch(pool, size); }, batch_result);
+        if (seq_result != pool_result || seq_result != batch_result) {
             std::cerr << "result mismatch at size " << size << '\n';
             return 1;
         }
-        const std::uint64_t tasks = kTotalUnits / size;
-        std::cout << std::setprecision(1) << std::setw(12) << size << std::setw(10) << tasks
-                  << std::setw(11) << seq << std::setw(12) << par << std::setw(9)
-                  << std::setprecision(2) << seq / par << 'x' << std::setw(16)
-                  << std::setprecision(3) << 1000.0 * par / static_cast<double>(tasks) << '\n';
+        std::cout << std::setprecision(1) << std::setw(12) << size << std::setw(9)
+                  << kTotalUnits / size << std::setw(11) << seq << std::setw(13) << par
+                  << std::setw(12) << bat << std::setprecision(2) << std::setw(9) << seq / par
+                  << 'x' << std::setw(8) << seq / bat << "x\n";
     }
 }

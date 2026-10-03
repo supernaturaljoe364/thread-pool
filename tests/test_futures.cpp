@@ -1,0 +1,215 @@
+#include "ThreadPool.hpp"
+#include "test_framework.hpp"
+
+#include <chrono>
+#include <functional>
+#include <future>
+#include <memory>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace std::chrono_literals;
+
+namespace {
+
+int square(int x) { return x * x; }
+
+struct Multiplier {
+    int factor;
+    int operator()(int x) const { return x * factor; }
+};
+
+struct Account {
+    int balance = 100;
+    int deposit(int amount) { return balance += amount; }
+};
+
+struct TaskError : std::runtime_error {
+    int code;
+    TaskError(const std::string& msg, int c) : std::runtime_error(msg), code(c) {}
+};
+
+}  // namespace
+
+TEST(returns_value_from_lambda) {
+    ThreadPool pool(2);
+    auto f = pool.submit([] { return 6 * 7; });
+    EXPECT_EQ(f.get(), 42);
+}
+
+TEST(returns_non_trivial_type) {
+    ThreadPool pool(2);
+    auto f = pool.submit([] { return std::string("hello from a worker"); });
+    EXPECT_EQ(f.get(), std::string("hello from a worker"));
+}
+
+TEST(void_task_future_signals_completion) {
+    ThreadPool pool(2);
+    bool done = false;  // plain bool: future.get() provides the synchronisation
+    std::future<void> f = pool.submit([&done] { done = true; });
+    f.get();
+    EXPECT_TRUE(done);
+}
+
+TEST(accepts_function_pointer_with_arguments) {
+    ThreadPool pool(2);
+    auto f = pool.submit(square, 9);
+    EXPECT_EQ(f.get(), 81);
+}
+
+TEST(accepts_function_object) {
+    ThreadPool pool(2);
+    auto f = pool.submit(Multiplier{3}, 5);
+    EXPECT_EQ(f.get(), 15);
+}
+
+TEST(accepts_member_function_pointer) {
+    ThreadPool pool(1);
+    Account acct;
+    auto f = pool.submit(&Account::deposit, &acct, 50);
+    EXPECT_EQ(f.get(), 150);
+    EXPECT_EQ(acct.balance, 150);
+}
+
+TEST(arguments_are_copied_at_submit_time) {
+    ThreadPool pool(1);
+    int value = 1;
+    auto f = pool.submit([](int v) { return v; }, value);
+    value = 999;  // must not affect the already-submitted task
+    EXPECT_EQ(f.get(), 1);
+}
+
+TEST(std_ref_passes_by_reference) {
+    ThreadPool pool(1);
+    int value = 0;
+    auto f = pool.submit([](int& v) { v = 123; }, std::ref(value));
+    f.get();
+    EXPECT_EQ(value, 123);
+}
+
+TEST(move_only_callable_argument_and_result) {
+    ThreadPool pool(2);
+    auto owned = std::make_unique<int>(10);
+    auto f = pool.submit(
+        [p = std::move(owned)](std::unique_ptr<int> q) { return std::make_unique<int>(*p + *q); },
+        std::make_unique<int>(5));
+    std::unique_ptr<int> result = f.get();
+    EXPECT_EQ(*result, 15);
+}
+
+TEST(exception_propagates_through_future) {
+    ThreadPool pool(2);
+    auto f = pool.submit([]() -> int { throw TaskError("task failed", 7); });
+
+    bool caught = false;
+    try {
+        f.get();
+    } catch (const TaskError& e) {  // original dynamic type is preserved
+        caught = true;
+        EXPECT_EQ(std::string(e.what()), std::string("task failed"));
+        EXPECT_EQ(e.code, 7);
+    }
+    EXPECT_TRUE(caught);
+}
+
+TEST(non_std_exception_propagates_through_future) {
+    ThreadPool pool(1);
+    auto f = pool.submit([] { throw 42; });
+    int caught = 0;
+    try {
+        f.get();
+    } catch (int v) {
+        caught = v;
+    }
+    EXPECT_EQ(caught, 42);
+}
+
+TEST(worker_survives_exceptions_and_keeps_serving) {
+    ThreadPool pool(1);  // a single worker: later tasks prove it is alive
+    std::vector<std::future<int>> futures;
+    for (int i = 0; i < 10; ++i) {
+        futures.push_back(pool.submit([i]() -> int {
+            if (i % 2 == 0) throw std::runtime_error("even");
+            return i;
+        }));
+    }
+    int ok = 0, failed = 0;
+    for (auto& f : futures) {
+        try {
+            f.get();
+            ++ok;
+        } catch (const std::runtime_error&) {
+            ++failed;
+        }
+    }
+    EXPECT_EQ(ok, 5);
+    EXPECT_EQ(failed, 5);
+}
+
+TEST(empty_std_function_reports_bad_function_call) {
+    ThreadPool pool(1);
+    auto f = pool.submit(std::function<int()>{});
+    bool caught = false;
+    try {
+        f.get();
+    } catch (const std::bad_function_call&) {
+        caught = true;
+    }
+    EXPECT_TRUE(caught);
+}
+
+TEST(shutdown_from_worker_surfaces_logic_error_in_future) {
+    ThreadPool pool(1);
+    auto f = pool.submit([&pool] { pool.shutdown(); });
+    bool caught = false;
+    try {
+        f.get();
+    } catch (const std::logic_error&) {
+        caught = true;
+    }
+    EXPECT_TRUE(caught);
+}
+
+TEST(task_can_submit_followup_task) {
+    ThreadPool pool(1);
+    auto outer = pool.submit([&pool] { return pool.submit([] { return 5; }); });
+    std::future<int> inner = outer.get();
+    EXPECT_EQ(inner.get(), 5);
+}
+
+TEST(future_get_publishes_non_atomic_writes) {
+    // get() synchronises-with the worker that ran the task, so everything the
+    // task wrote is visible afterwards without atomics. TSan verifies this.
+    ThreadPool pool(4);
+    std::vector<int> data(10'000);
+    auto f = pool.submit([&data] { std::iota(data.begin(), data.end(), 0); });
+    f.get();
+    long long sum = std::accumulate(data.begin(), data.end(), 0LL);
+    EXPECT_EQ(sum, 49'995'000LL);
+}
+
+TEST(many_futures_collected_in_submission_order) {
+    ThreadPool pool(4);
+    std::vector<std::future<long long>> futures;
+    for (long long i = 1; i <= 200; ++i) {
+        futures.push_back(pool.submit([i] { return i * i; }));
+    }
+    long long total = 0;
+    for (auto& f : futures) total += f.get();
+    EXPECT_EQ(total, 2'686'700LL);  // sum of squares 1..200
+}
+
+TEST(future_is_not_ready_until_task_finishes) {
+    ThreadPool pool(1);
+    std::promise<void> gate;
+    std::shared_future<void> opened = gate.get_future().share();
+    auto f = pool.submit([opened] { opened.wait(); return 1; });
+
+    EXPECT_TRUE(f.wait_for(30ms) == std::future_status::timeout);
+    gate.set_value();
+    EXPECT_EQ(f.get(), 1);
+}
+
+int main() { return RUN_ALL_TESTS(); }

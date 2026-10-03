@@ -331,3 +331,122 @@ queued and running work.
 Clean under GCC/Clang plus TSan and ASan/UBSan. Mutation checks:
 - deleting `queue_.close()` from `shutdown()` makes the suite **hang**
 - deleting the worker's `try/catch` makes it **terminate**
+
+---
+
+## 3. Results and exceptions through `std::future`
+
+### The problem
+
+A worker runs the task on *another thread*, possibly after `submit()` has
+already returned. The caller needs a handle for "a value that doesn't exist
+yet" that it can block on, and a way to get an *error* back across threads too.
+
+### The three pieces
+
+| Type | Role |
+|---|---|
+| `std::promise<T>` | the **write end**: `set_value(v)` / `set_exception(eptr)`, called once |
+| `std::future<T>` | the **read end**: `get()` blocks until the value/exception arrives, then returns/rethrows it. One-shot, move-only |
+| `std::packaged_task<R()>` | a callable **plus** a promise: calling it runs the function and feeds the result (or exception) into the promise |
+
+Promise and future share a heap-allocated **shared state** (value slot,
+exception slot, ready flag, mutex + condvar). `future.get()` is essentially
+`wait for ready; return value or rethrow exception`.
+
+### How `submit()` works (Q12)
+
+```cpp
+auto bound = [func = std::forward<F>(f), ...captured = std::forward<Args>(args)]() mutable -> R {
+    return std::invoke(std::move(func), std::move(captured)...);
+};
+auto task = std::make_shared<std::packaged_task<R()>>(std::move(bound));
+std::future<R> result = task->get_future();
+enqueue([task] { (*task)(); });
+return result;
+```
+
+1. **Bind** `f(args...)` into a zero-argument lambda. Arguments are
+   decay-copied or moved in (`std::forward` into an init-capture). The task owns
+   its inputs and can't dangle into the caller's stack frame after `submit`
+   returns. To share a variable deliberately, pass `std::ref(x)`, the same
+   convention as `std::thread`.
+2. **`std::invoke`** makes one code path work for lambdas, function pointers,
+   functors **and** member-function pointers (`submit(&Account::deposit, &acct, 50)`).
+3. **Wrap in `packaged_task<R()>`** and take its future *before* enqueuing.
+   After `enqueue`, a worker may run the task immediately.
+4. **Type-erase to `std::function<void()>`.** The queue holds one type no
+   matter what each task returns. The future carries `R`; the queue never needs
+   to know it.
+
+**Why `shared_ptr<packaged_task>`?** `packaged_task` is move-only, and
+`std::function` requires its target to be *copyable*. A lambda holding a
+`shared_ptr` is copyable. The cost is one extra heap allocation per task.
+C++23's `std::move_only_function` removes this workaround.
+
+**Why the `requires` clause?** Without it, `submit(f, wrong_args)` fails deep
+inside `invoke_result_t` with a long template error. With it, the compiler
+says *"constraints not satisfied: is_invocable_v<...> evaluated to false"* at
+the call site.
+
+**The return type** is computed with `std::invoke_result_t<decay_t<F>, decay_t<Args>...>`,
+which is exactly how the stored callable is called (as rvalues), so the
+declared type always matches what `invoke` produces.
+
+### How exceptions propagate (Q13)
+
+Inside `packaged_task::operator()` the standard library does roughly:
+
+```cpp
+try {
+    promise.set_value(fn());
+} catch (...) {
+    promise.set_exception(std::current_exception());
+}
+```
+
+`std::current_exception()` captures the in-flight exception as an
+`std::exception_ptr`, a reference-counted handle to the *original exception
+object*, not a sliced copy. `future.get()` calls `std::rethrow_exception`, so the
+caller catches the **same dynamic type** (`TaskError` with its `code` field,
+even `throw 42`) on the caller's thread.
+
+As a result the worker never sees the exception. The `try/catch` in
+`worker_loop()` is now purely defensive.
+
+Other ways errors reach the future:
+- `submit(std::function<int()>{})`: calling an empty function throws
+  `std::bad_function_call`, which lands in the future.
+- `pool.shutdown()` inside a task throws `std::logic_error`, which lands in the
+  future.
+- If a `packaged_task` were destroyed without running, its future would get
+  `std::future_error(broken_promise)`. Drain-on-shutdown guarantees that never
+  happens for an accepted task.
+
+### Memory visibility
+
+`promise.set_value()` *synchronizes-with* the `future.get()` that observes it.
+Everything the task wrote before finishing *happens-before* everything the
+caller does after `get()` returns. That's why a task can fill a plain
+`std::vector<int>` and the caller can read it after `get()` with no atomics
+(`future_get_publishes_non_atomic_writes`, verified race-free by TSan).
+
+### Pitfalls
+
+| Pitfall | Notes |
+|---|---|
+| Discarding the future | Allowed (fire-and-forget), but any exception is then silently lost. |
+| Calling `get()` twice | `std::future` is one-shot; a 2nd `get()` is UB/`future_error`. Use `std::shared_future` for multiple readers. |
+| **Waiting on a future inside a task** | **Deadlock risk.** If every worker blocks in `get()` waiting for tasks still in the queue, nobody is left to run them. With a 1-worker pool, `submit([&]{ return pool.submit(g).get(); })` hangs forever. Prefer returning the inner future (see `task_can_submit_followup_task`) or keep dependent work out of the pool. |
+| Capturing by reference | `[&x]` in the lambda bypasses the copy-at-submit behaviour; the caller must keep `x` alive until the future is ready. |
+| `std::async` vs this | `std::async`'s future **blocks in its destructor**; ours doesn't, because the pool, not the future, owns the work. |
+
+### Verification
+
+`tests/test_futures.cpp` (18 tests): values, strings, `void`, function pointers,
+functors, member-function pointers, copy-at-submit semantics, `std::ref`,
+move-only callable + argument + result, custom exception type & fields
+preserved, non-`std::exception` types, worker survives alternating failures,
+empty `std::function`, shutdown-from-worker via future, nested submission,
+memory visibility through `get()`, ordered collection, and a future that stays
+not-ready until a gate opens.

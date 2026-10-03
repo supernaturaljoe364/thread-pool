@@ -44,3 +44,4 @@ endfunction()
 
 tp_add_test(test_blocking_queue)
 tp_add_test(test_thread_pool)
+tp_add_test(test_futures)

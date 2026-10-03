@@ -46,10 +46,7 @@ ThreadPool::~ThreadPool() {
     shutdown();
 }
 
-void ThreadPool::submit(std::function<void()> task) {
-    if (!task) {
-        throw std::invalid_argument("ThreadPool::submit() given an empty task");
-    }
+void ThreadPool::enqueue(std::function<void()> task) {
     // push() checks `closed` under the queue's lock, so a task is either
     // accepted before shutdown (and guaranteed to run) or rejected -- there is
     // no window where it is accepted but silently dropped.
@@ -86,10 +83,11 @@ void ThreadPool::worker_loop() {
         try {
             (*task)();
         } catch (...) {
-            // A throwing task must not take the worker down with it: an
-            // exception escaping a thread's function calls std::terminate().
-            // Fire-and-forget tasks have nowhere to report errors, so the
-            // exception is dropped here.
+            // Defensive only. Tasks arrive wrapped in std::packaged_task, which
+            // catches whatever the user's callable throws and stores it in the
+            // future. This catch guarantees that even if something slips
+            // through, it can't escape the thread function and std::terminate()
+            // the process.
         }
     }
 }

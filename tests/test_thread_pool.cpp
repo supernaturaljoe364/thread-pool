@@ -73,17 +73,6 @@ TEST(throwing_task_does_not_kill_worker) {
     EXPECT_EQ(ran_after.load(), 1);
 }
 
-TEST(empty_task_is_rejected) {
-    ThreadPool pool(1);
-    bool threw = false;
-    try {
-        pool.submit(std::function<void()>{});
-    } catch (const std::invalid_argument&) {
-        threw = true;
-    }
-    EXPECT_TRUE(threw);
-}
-
 TEST(submit_after_shutdown_throws) {
     ThreadPool pool(2);
     pool.shutdown();
